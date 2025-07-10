@@ -3,40 +3,12 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { Container, Navbar, Nav, Button, Modal, Form, Alert } from 'react-bootstrap';
 import WaferMapVisualization from './WaferMapVisualization';
 import { parseG85 } from './utils/g85Utils';
+import apiService from './services/api';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import './App.css';
 
-// Mock data storage (in production, this would be a database)
-const mockUsers = [
-  { username: 'user1', password: 'password123', role: 'user' },
-  { username: 'admin', password: 'admin123', role: 'admin' }
-];
-
-const mockLots = [
-  {
-    id: 1,
-    filename: 'lot_001.g85',
-    uploadedBy: 'user1',
-    uploadDate: '2024-01-15',
-    status: 'pending',
-    mapData: null,
-    defects: [
-      { x: 10, y: 20, defectType: 'scratch', severity: 'minor' },
-      { x: 45, y: 67, defectType: 'dent', severity: 'major' }
-    ]
-  },
-  {
-    id: 2,
-    filename: 'lot_002.g85',
-    uploadedBy: 'user1',
-    uploadDate: '2024-01-16',
-    status: 'approved',
-    mapData: null,
-    defects: [
-      { x: 15, y: 25, defectType: 'scratch', severity: 'minor' }
-    ]
-  }
-];
+// Initialize lots state from backend
+const initialLots = [];
 
 // G85 to Wafer Map Converter (updated for professional G85 data)
 const convertG85ToWaferMap = (mapData) => {
@@ -52,7 +24,7 @@ const convertG85ToWaferMap = (mapData) => {
 
 function App() {
   const [currentUser, setCurrentUser] = useState(null);
-  const [lots, setLots] = useState(mockLots);
+  const [lots, setLots] = useState(initialLots);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [selectedLot, setSelectedLot] = useState(null);
@@ -60,29 +32,41 @@ function App() {
   const [uploadForm, setUploadForm] = useState({ file: null, description: '' });
   const [alert, setAlert] = useState(null);
   const [statusFilter, setStatusFilter] = useState('all');
+  const [loading, setLoading] = useState(false);
 
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
-    const user = mockUsers.find(u => 
-      u.username === loginForm.username && u.password === loginForm.password
-    );
+    setLoading(true);
     
-    if (user) {
-      setCurrentUser(user);
-      setShowLoginModal(false);
-      setLoginForm({ username: '', password: '' });
-      setAlert({ type: 'success', message: 'Login successful!' });
-    } else {
-      setAlert({ type: 'danger', message: 'Invalid credentials!' });
+    try {
+      const response = await apiService.login(loginForm.username, loginForm.password);
+      
+      if (response.success) {
+        setCurrentUser(response.user);
+        setShowLoginModal(false);
+        setLoginForm({ username: '', password: '' });
+        setAlert({ type: 'success', message: 'Login successful!' });
+        
+        // Load lots after successful login
+        loadLots();
+      } else {
+        setAlert({ type: 'danger', message: response.error || 'Login failed!' });
+      }
+    } catch (error) {
+      setAlert({ type: 'danger', message: error.message || 'Login failed!' });
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleLogout = () => {
+    apiService.clearToken();
     setCurrentUser(null);
+    setLots([]);
     setAlert({ type: 'info', message: 'Logged out successfully!' });
   };
 
-  const handleFileUpload = (e) => {
+  const handleFileUpload = async (e) => {
     e.preventDefault();
     if (!uploadForm.file) {
       setAlert({ type: 'warning', message: 'Please select a file!' });
@@ -95,60 +79,105 @@ function App() {
       return;
     }
 
-    // Parse G85 file using the professional parser
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const content = event.target.result;
-        const mapData = parseG85(content);
-        
-        // Extract defect information for display
-        const defects = [];
-        for (const [coord, status] of mapData.dies) {
-          if (status === "EF") {
-            const [x, y] = coord.split(',').map(Number);
-            defects.push({
-              x: x,
-              y: y,
-              defectType: 'defect',
-              severity: 'major'
-            });
-          }
-        }
-
-        const newLot = {
-          id: Date.now(),
-          filename: file.name,
-          uploadedBy: currentUser.username,
-          uploadDate: new Date().toISOString().split('T')[0],
-          status: 'pending',
-          description: uploadForm.description,
-          mapData: mapData,
-          defects: defects
-        };
-
-        setLots([...lots, newLot]);
+    setLoading(true);
+    
+    try {
+      // Upload file to backend
+      const response = await apiService.uploadLot(file, uploadForm.description);
+      
+      if (response.success) {
         setShowUploadModal(false);
         setUploadForm({ file: null, description: '' });
-        setAlert({ type: 'success', message: 'G85 file uploaded and parsed successfully!' });
-      } catch (error) {
-        console.error('Error parsing G85 file:', error);
-        setAlert({ type: 'danger', message: 'Error parsing G85 file. Please ensure it\'s a valid G85 XML format.' });
+        setAlert({ type: 'success', message: 'G85 file uploaded and processed successfully!' });
+        
+        // Reload lots to show the new upload
+        loadLots();
+      } else {
+        setAlert({ type: 'danger', message: response.error || 'Upload failed!' });
       }
-    };
-    reader.readAsText(file);
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      setAlert({ type: 'danger', message: error.message || 'Error uploading file. Please ensure it\'s a valid G85 XML format.' });
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleApproval = (lotId, status) => {
-    setLots(lots.map(lot => 
-      lot.id === lotId ? { ...lot, status } : lot
-    ));
-    setAlert({ type: 'success', message: `Lot ${status} successfully!` });
+  const handleApproval = async (lotId, status) => {
+    setLoading(true);
+    
+    try {
+      const response = await apiService.updateLotStatus(lotId, status);
+      
+      if (response.success) {
+        // Update local state
+        setLots(lots.map(lot => 
+          lot.id === lotId ? { ...lot, status } : lot
+        ));
+        setAlert({ type: 'success', message: `Lot ${status} successfully!` });
+      } else {
+        setAlert({ type: 'danger', message: response.error || 'Status update failed!' });
+      }
+    } catch (error) {
+      setAlert({ type: 'danger', message: error.message || 'Status update failed!' });
+    } finally {
+      setLoading(false);
+    }
   };
 
   const openVisualizer = (lot) => {
     setSelectedLot(lot);
   };
+
+  // Load lots from backend
+  const loadLots = async () => {
+    if (!currentUser) return;
+    
+    setLoading(true);
+    try {
+      const params = {};
+      if (statusFilter !== 'all') {
+        params.status = statusFilter;
+      }
+      
+      const response = await apiService.getLots(params);
+      if (response.success) {
+        setLots(response.data);
+      }
+    } catch (error) {
+      console.error('Error loading lots:', error);
+      setAlert({ type: 'danger', message: 'Failed to load lots' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Load lots when user logs in or filter changes
+  useEffect(() => {
+    if (currentUser) {
+      loadLots();
+    }
+  }, [currentUser, statusFilter]);
+
+  // Check authentication on app start
+  useEffect(() => {
+    const checkAuth = async () => {
+      const token = localStorage.getItem('token');
+      if (token) {
+        try {
+          const response = await apiService.getCurrentUser();
+          if (response.success) {
+            setCurrentUser(response.user);
+          }
+        } catch (error) {
+          console.error('Auth check failed:', error);
+          apiService.clearToken();
+        }
+      }
+    };
+    
+    checkAuth();
+  }, []);
 
   // Filter lots based on status
   const filteredLots = statusFilter === 'all' 
@@ -181,6 +210,7 @@ function App() {
               variant={statusFilter === 'all' ? 'primary' : 'outline-secondary'}
               size="sm"
               onClick={() => setStatusFilter('all')}
+              disabled={loading}
             >
               All ({lots.length})
             </Button>
@@ -188,6 +218,7 @@ function App() {
               variant={statusFilter === 'pending' ? 'warning' : 'outline-warning'}
               size="sm"
               onClick={() => setStatusFilter('pending')}
+              disabled={loading}
             >
               Pending ({lots.filter(lot => lot.status === 'pending').length})
             </Button>
@@ -195,6 +226,7 @@ function App() {
               variant={statusFilter === 'approved' ? 'success' : 'outline-success'}
               size="sm"
               onClick={() => setStatusFilter('approved')}
+              disabled={loading}
             >
               Approved ({lots.filter(lot => lot.status === 'approved').length})
             </Button>
@@ -202,12 +234,23 @@ function App() {
               variant={statusFilter === 'rejected' ? 'danger' : 'outline-danger'}
               size="sm"
               onClick={() => setStatusFilter('rejected')}
+              disabled={loading}
             >
               Rejected ({lots.filter(lot => lot.status === 'rejected').length})
             </Button>
           </div>
         </div>
       </div>
+
+      {/* Loading Indicator */}
+      {loading && (
+        <div className="text-center my-4">
+          <div className="spinner-border text-primary" role="status">
+            <span className="visually-hidden">Loading...</span>
+          </div>
+          <p className="mt-2 text-muted">Loading...</p>
+        </div>
+      )}
 
       <div className="row">
         {filteredLots.map(lot => (
@@ -400,11 +443,11 @@ function App() {
                 />
               </Form.Group>
               <div className="d-flex justify-content-end">
-                <Button variant="secondary" className="me-2" onClick={() => setShowLoginModal(false)}>
+                <Button variant="secondary" className="me-2" onClick={() => setShowLoginModal(false)} disabled={loading}>
                   Cancel
                 </Button>
-                <Button variant="primary" type="submit">
-                  Login
+                <Button variant="primary" type="submit" disabled={loading}>
+                  {loading ? 'Logging in...' : 'Login'}
                 </Button>
               </div>
             </Form>
@@ -441,11 +484,11 @@ function App() {
                 />
               </Form.Group>
               <div className="d-flex justify-content-end">
-                <Button variant="secondary" className="me-2" onClick={() => setShowUploadModal(false)}>
+                <Button variant="secondary" className="me-2" onClick={() => setShowUploadModal(false)} disabled={loading}>
                   Cancel
                 </Button>
-                <Button variant="primary" type="submit">
-                  Upload Lot
+                <Button variant="primary" type="submit" disabled={loading}>
+                  {loading ? 'Uploading...' : 'Upload Lot'}
                 </Button>
               </div>
             </Form>
